@@ -3,136 +3,149 @@ import re
 import sys
 import logging
 import pathlib
-from typing import List, Pattern, Optional, Dict
+import os
+import tempfile
+from typing import List, Pattern, Final
 
-class LogVigilanteError(Exception):
-    """Base exception for LogVigilante tool."""
-    pass
+class LogVigilanteError(Exception): """Base exception for the LogVigilante domain."""
 
-class ConfigurationError(LogVigilanteError):
-    """Raised when CLI arguments or regex patterns are invalid."""
-    pass
+class ConfigurationError(LogVigilanteError): """Raised during initialization due to invalid parameters or environment."""
 
-class ProcessingError(LogVigilanteError):
-    """Raised when file I/O or stream processing fails."""
-    pass
+class ProcessingError(LogVigilanteError): """Raised during active stream processing due to I/O or system interrupts."""
 
 class LogProcessor:
     """
-    Core logic for scanning and sanitizing log files using a Fail-Fast philosophy.
+    A high-integrity log sanitization engine implementing atomic writes and O(1) memory streaming.
 
-    This processor ensures that all system-level requirements (permissions, path existence,
-    regex validity) are met during initialization before any file handles are opened.
-    
-    :param input_path: String path to the source log file.
-    :param output_path: String path to the destination sanitized file.
-    :param patterns: List of raw regex strings to identify sensitive data.
-    :param mask_char: Character used to replace sensitive matches. Defaults to '*'.
+    The processor ensures data integrity by writing to a temporary file in the destination 
+    directory and performing an atomic rename upon successful completion. This prevents 
+    leaving truncated files in the event of a system crash or disk exhaustion.
+
+    Attributes:
+        BUFFER_SIZE (int): 64KB chunk size for optimized I/O buffering.
     """
+    BUFFER_SIZE: Final[int] = 65536
 
     def __init__(self, input_path: str, output_path: str, patterns: List[str], mask_char: str = "*"):
-        self.input_path = pathlib.Path(input_path)
-        self.output_path = pathlib.Path(output_path)
+        """
+        Initializes the processor with validated configuration.
+
+        :param input_path: Source log file path.
+        :param output_path: Destination for sanitized output.
+        :param patterns: Regex strings to redact.
+        :param mask_char: Single character for masking. Defaults to '*'.
+        :raises ConfigurationError: If paths are invalid, permissions are missing, or regex is malformed.
+        """
+        self.input_path = pathlib.Path(input_path).resolve()
+        self.output_path = pathlib.Path(output_path).resolve()
+        
+        if len(mask_char) != 1:
+            raise ConfigurationError(f"mask_char must be exactly 1 character, got: {len(mask_char)}")
         self.mask_char = mask_char
+        
         self.patterns = self._compile_patterns(patterns)
         self.redaction_count = 0
-        self._validate_paths()
+        self._validate_environment()
 
     def _compile_patterns(self, patterns: List[str]) -> List[Pattern]:
-        """
-        Compiles regex strings into objects.
-
-        :raises ConfigurationError: If a pattern is syntactically invalid.
-        """
+        """Compiles regex strings into re.Pattern objects with error catching."""
         if not patterns:
-            raise ConfigurationError("No patterns provided for sanitization.")
+            raise ConfigurationError("No redaction patterns provided.")
         
         compiled = []
         for p in patterns:
             try:
                 compiled.append(re.compile(p))
             except re.error as e:
-                raise ConfigurationError(f"Invalid regex pattern '{p}': {e}")
+                raise ConfigurationError(f"Regex compilation failed for '{p}': {e}")
         return compiled
 
-    def _validate_paths(self):
+    def _validate_environment(self):
         """
-        Ensures filesystem integrity before processing.
-
-        Checks include existence of input, writability of output parent,
-        and path collisions.
-
-        :raises ConfigurationError: If path validation fails.
+        Validates filesystem state using cross-platform access checks.
+        Ensures input is readable and output directory is writable/executable.
         """
-        if not self.input_path.exists():
-            raise ConfigurationError(f"Input file not found: {self.input_path}")
         if not self.input_path.is_file():
-            raise ConfigurationError(f"Input path is not a file: {self.input_path}")
-        if self.input_path == self.output_path:
-            raise ConfigurationError("Input and output paths must be different to prevent data loss.")
+            raise ConfigurationError(f"Input source is missing or not a file: {self.input_path}")
         
-        # Check if output directory exists and is writable
+        if not os.access(self.input_path, os.R_OK):
+            raise ConfigurationError(f"Read permission denied for input: {self.input_path}")
+
+        if self.input_path == self.output_path:
+            raise ConfigurationError("In-place editing is not supported. Input and Output must differ.")
+
         output_dir = self.output_path.parent
         if not output_dir.exists():
             raise ConfigurationError(f"Output directory does not exist: {output_dir}")
-        if not (output_dir.is_dir() and (sys.platform == 'win32' or output_dir.stat().st_mode & 0o200)):
-            raise ConfigurationError(f"Output directory is not writable: {output_dir}")
+        
+        if not os.access(output_dir, os.W_OK | os.X_OK):
+            raise ConfigurationError(f"Insufficient permissions to write in output directory: {output_dir}")
 
     def _mask_match(self, match: re.Match) -> str:
-        """Internal helper to count matches and return mask string."""
+        """Callback for re.sub to increment metrics while masking."""
         self.redaction_count += 1
         return self.mask_char * len(match.group(0))
 
     def process(self) -> int:
         """
-        Streams the file line-by-line to minimize memory footprint and applies masking.
+        Performs atomic line-by-line streaming redaction.
 
-        Uses context managers to ensure safe resource disposal even on failure.
-        
-        :return: Total number of redactions performed.
-        :raises ProcessingError: If disk is full, permissions are lost, or encoding fails.
+        Implementation Details:
+        1. Opens input with 'replace' error handler to survive malformed encoding.
+        2. Creates a temporary file in the target directory.
+        3. Streams and redacts line by line.
+        4. flushes and fsyncs the temp file to disk.
+        5. Atomic move to final destination.
+
+        :return: Total number of sensitive matches redacted.
+        :raises ProcessingError: If I/O failure occurs or disk is full.
         """
+        temp_fd, temp_path = tempfile.mkstemp(dir=self.output_path.parent, prefix=".vigilante_")
         line_no = 0
         try:
             with self.input_path.open('r', encoding='utf-8', errors='replace') as fin, \
-                 self.output_path.open('w', encoding='utf-8') as fout:
+                 os.fdopen(temp_fd, 'w', encoding='utf-8') as fout:
+                
                 for line in fin:
                     line_no += 1
-                    sanitized_line = line
+                    sanitized = line
                     for pattern in self.patterns:
-                        sanitized_line = pattern.sub(self._mask_match, sanitized_line)
-                    fout.write(sanitized_line)
+                        sanitized = pattern.sub(self._mask_match, sanitized)
+                    fout.write(sanitized)
+                
+                fout.flush()
+                os.fsync(fout.fileno())
+
+            os.replace(temp_path, self.output_path)
             return self.redaction_count
-        except (OSError, IOError) as e:
-            raise ProcessingError(f"Failed during file streaming at line {line_no}: {e}")
+
         except Exception as e:
-            raise ProcessingError(f"Unexpected error at line {line_no}: {e}")
+            if os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except: pass
+            raise ProcessingError(f"Streaming failure at line {line_no}: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="LogVigilante: Robust Log Sanitizer")
-    parser.add_argument("--input", "-i", required=True, help="Path to raw log file")
-    parser.add_argument("--output", "-o", required=True, help="Path to write sanitized log")
-    parser.add_argument("--patterns", "-p", nargs='+', default=[r"\b\d{4}-\d{4}-\d{4}-\d{4}\b"], help="Regex patterns to mask")
-    parser.add_argument("--mask-char", default="*", help="Character to use for masking")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    parser = argparse.ArgumentParser(description="LogVigilante: Industrial-Grade Log Masking")
+    parser.add_argument("-i", "--input", required=True, help="Path to source log")
+    parser.add_argument("-o", "--output", required=True, help="Path to destination log")
+    parser.add_argument("-p", "--patterns", nargs='+', default=[r"\b\d{4}-\d{4}-\d{4}-\d{4}\b"], help="Regexes to mask")
+    parser.add_argument("-m", "--mask-char", default="*", help="Single masking character")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
-
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s [%(levelname)s] %(message)s')
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
     try:
-        processor = LogProcessor(args.input, args.output, args.patterns, args.mask_char)
-        logging.info(f"Starting sanitization: {args.input} -> {args.output}")
-        
-        count = processor.process()
-        
-        logging.info(f"Sanitization completed. Total redactions performed: {count}")
+        proc = LogProcessor(args.input, args.output, args.patterns, args.mask_char)
+        logging.info(f"Processing: {proc.input_path} -> {proc.output_path}")
+        count = proc.process()
+        logging.info(f"Success. Total redactions: {count}")
     except LogVigilanteError as e:
-        logging.error(f"Application Error: {e}")
+        logging.error(f"Business Logic Failure: {e}")
         sys.exit(1)
     except Exception as e:
-        logging.critical(f"Unexpected Runtime Failure: {e}", exc_info=True)
+        logging.critical(f"System Fault: {e}", exc_info=True)
         sys.exit(2)
 
 if __name__ == '__main__':
