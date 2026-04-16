@@ -7,35 +7,38 @@ import os
 import tempfile
 import shutil
 import signal
-from typing import List, Pattern, Final, Iterator, Optional, Any
+import errno
+from typing import List, Pattern, Final, Iterator, Optional, Any, Union
 from types import FrameType
-from contextlib import contextmanager
 
 class LogVigilanteError(Exception): """Base exception for the LogVigilante domain."""
 class ConfigurationError(LogVigilanteError): """Raised during initialization due to invalid parameters."""
 class ProcessingError(LogVigilanteError): """Raised during active stream processing."""
-class SecurityPolicyViolation(ProcessingError): """Raised when a log line exceeds safety limits (Log Bomb protection)."""
+class SecurityPolicyViolation(ProcessingError): """Raised when a log line exceeds safety limits."""
 
 class LogProcessor:
     """
     A high-integrity log sanitization engine designed for mission-critical audit trails.
 
-    This class implements atomic file operations, ensuring that the target file is either
-    fully updated and synced to physical media, or remains unchanged. It protects against
-    Memory Exhaustion (OOM) via bounded line reads and prevents 'Pattern Evasion' by 
-    refusing to process lines that exceed the safety buffer.
+    Attributes:
+        MAX_LINE_BUFFER (int): The maximum allowed bytes per line (10MB) to prevent OOM.
+        CHUNK_SIZE (int): Buffer size for IO operations.
     """
-    MAX_LINE_BUFFER: Final[int] = 10 * 1024 * 1024  # 10MB Line Limit Safety
+    MAX_LINE_BUFFER: Final[int] = 10 * 1024 * 1024
+    CHUNK_SIZE: Final[int] = 64 * 1024
 
-    def __init__(self, input_path: str, output_path: str, patterns: List[str], mask_char: str = "*"):
+    def __init__(self, input_path: str, output_path: str, patterns: List[str], mask_char: str = "*") -> None:
         """
-        Initializes the processor with path validation.
+        Initializes the processor with rigorous path resolution and pattern compilation.
 
         Args:
-            input_path: Path to source log file.
-            output_path: Destination path for redacted output.
-            patterns: List of regex strings to redact.
-            mask_char: Character used for masking matches.
+            input_path: Source log file.
+            output_path: Destination for redacted content.
+            patterns: List of regex strings to mask.
+            mask_char: The character used to obscure sensitive data.
+
+        Raises:
+            ConfigurationError: If paths are invalid or patterns cannot be compiled.
         """
         self.input_path = pathlib.Path(input_path).resolve()
         self.output_path = pathlib.Path(output_path).resolve()
@@ -53,78 +56,75 @@ class LogProcessor:
         except re.error as e:
             raise ConfigurationError(f"Regex compilation failed: {e}")
 
-    def _validate_environment(self) -> None:
+    def _validate_environment(self) -> None: 
         if not self.input_path.is_file():
             raise ConfigurationError(f"Source is not a valid file: {self.input_path}")
         if self.input_path == self.output_path:
-            raise ConfigurationError("In-place editing is disabled to prevent data loss on crash.")
+            raise ConfigurationError("In-place editing is prohibited to prevent data corruption.")
         
         out_dir = self.output_path.parent
         if not out_dir.exists():
             raise ConfigurationError(f"Output directory does not exist: {out_dir}")
         if not os.access(out_dir, os.W_OK | os.X_OK):
-            raise ConfigurationError(f"Insufficient permissions for directory: {out_dir}")
+            raise ConfigurationError(f"Insufficient directory permissions: {out_dir}")
 
     def request_shutdown(self) -> None:
-        """Flag the processor to stop at the next iteration for clean exit."""
+        """Triggers a graceful exit by setting the internal shutdown flag."""
         self._shutdown_requested = True
 
     def _mask_match(self, match: re.Match) -> str:
         self.redaction_count += 1
         return self.mask_char * len(match.group(0))
 
-    def _safe_line_iterator(self, file_handle: Any) -> Iterator[str]:
+    def _safe_readline_iterator(self, file_handle: Any) -> Iterator[str]:
         """
-        Yields lines while strictly enforcing length limits.
-        
-        Logic: If a line exceeds MAX_LINE_BUFFER without a newline, we treat it as a 
-        security risk (malformed log/log bomb) rather than yielding partial data which 
-        would cause regex patterns to miss matches.
+        Reads lines using a hard limit. Unlike standard iterators, this prevents
+        loading massive single-line log bombs into memory.
         """
-        for line in file_handle:
-            if self._shutdown_requested:
+        while not self._shutdown_requested:
+            line = file_handle.readline(self.MAX_LINE_BUFFER + 1)
+            if not line:
                 break
-            if len(line) >= self.MAX_LINE_BUFFER and not line.endswith(('\n', '\r')):
-                raise SecurityPolicyViolation(f"Line length exceeds limit of {self.MAX_LINE_BUFFER} bytes.")
+            if len(line) > self.MAX_LINE_BUFFER:
+                raise SecurityPolicyViolation("Line length exceeds the safety threshold; possible log bomb detected.")
             yield line
 
     def process(self) -> int:
         """
-        Executes the redaction pipeline with multi-stage durability guarantees.
-        
+        Executes the redaction pipeline with multi-stage durability and atomicity.
+
         Returns:
-            Total count of redacted occurrences.
-        
+            int: Total count of redacted occurrences.
+
         Raises:
-            ProcessingError: If any IO or integrity check fails.
+            ProcessingError: On IO failure, permission error, or integrity check failure.
         """
         temp_path: Optional[pathlib.Path] = None
-        
         try:
-            # 1. Create secure temporary file in the destination directory (prevents cross-dev rename issues)
             fd, path_str = tempfile.mkstemp(dir=self.output_path.parent, prefix=".vig_tmp_", text=True)
             temp_path = pathlib.Path(path_str)
             
             try:
                 with os.fdopen(fd, 'w', encoding='utf-8') as fout:
                     with self.input_path.open('r', encoding='utf-8', errors='replace') as fin:
-                        for line in self._safe_line_iterator(fin):
+                        for line in self._safe_readline_iterator(fin):
                             sanitized = line
                             for pattern in self.patterns:
                                 sanitized = pattern.sub(self._mask_match, sanitized)
                             fout.write(sanitized)
                         
-                    # 2. Flush and hardware sync data to disk before metadata swap
                     fout.flush()
                     os.fsync(fout.fileno())
 
-                # 3. Mirror original file permissions
                 shutil.copymode(str(self.input_path), str(temp_path))
                 
-                # 4. Perform atomic filesystem swap
-                os.replace(temp_path, self.output_path)
+                try:
+                    os.replace(temp_path, self.output_path)
+                except OSError as e:
+                    if e.errno == errno.EXDEV:
+                        raise ProcessingError("Atomic move failed across device boundaries.") from e
+                    raise
                 
-                # 5. Persist the directory entry (Required for durability on many POSIX systems)
                 if os.name != 'nt':
                     dir_fd = os.open(str(self.output_path.parent), os.O_RDONLY)
                     try:
@@ -134,42 +134,42 @@ class LogProcessor:
 
                 return self.redaction_count
 
-            except Exception as inner_e:
-                # Clean up the specific FD if open/write failed
+            except Exception:
                 if temp_path and temp_path.exists():
                     temp_path.unlink()
-                raise inner_e
+                raise
 
         except Exception as e:
-            raise ProcessingError(f"Atomic write operation failed: {e}") from e
+            if isinstance(e, LogVigilanteError): raise
+            raise ProcessingError(f"Atomic operation failed: {e}") from e
 
 def main():
-    parser = argparse.ArgumentParser(description="LogVigilante 2.1: Secure Log Redaction")
-    parser.add_argument("-i", "--input", required=True, help="Source log file path")
-    parser.add_argument("-o", "--output", required=True, help="Sanitized output path")
-    parser.add_argument("-p", "--patterns", nargs='+', required=True, help="Regex patterns to mask")
-    parser.add_argument("-m", "--mask-char", default="*", help="Character for masking (default: *)")
+    parser = argparse.ArgumentParser(description="LogVigilante: Atomic Log Redaction")
+    parser.add_argument("-i", "--input", required=True)
+    parser.add_argument("-o", "--output", required=True)
+    parser.add_argument("-p", "--patterns", nargs='+', required=True)
+    parser.add_argument("-m", "--mask-char", default="*")
 
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
     
-    processor = LogProcessor(args.input, args.output, args.patterns, args.mask_char)
-
-    def signal_handler(sig: int, frame: Optional[FrameType]):
-        logging.warning(f"Signal {sig} received. Graceful shutdown initiated...")
-        processor.request_shutdown()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
     try:
+        processor = LogProcessor(args.input, args.output, args.patterns, args.mask_char)
+
+        def signal_handler(sig: int, frame: Optional[FrameType]):
+            logging.warning(f"Received signal {sig}. Aborting stream safely...")
+            processor.request_shutdown()
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
         count = processor.process()
-        logging.info(f"Redaction successful. {count} sensitive tokens masked.")
+        logging.info(f"Redaction complete. {count} sensitive occurrences masked.")
     except LogVigilanteError as e:
-        logging.error(f"Application Error: {e}")
+        logging.error(f"Critical failure: {e}")
         sys.exit(1)
     except Exception as e:
-        logging.critical(f"Unrecoverable System Fault: {e}", exc_info=True)
+        logging.critical(f"Unexpected system fault: {e}", exc_info=True)
         sys.exit(2)
 
 if __name__ == '__main__':
